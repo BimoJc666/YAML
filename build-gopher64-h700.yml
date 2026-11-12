@@ -133,11 +133,16 @@ jobs:
               export CC=clang CXX=clang++ AR=llvm-ar
 
               cd /work/upstream
+              # O checkout foi montado do runner para dentro do Docker; o dono numérico
+              # pode ser diferente. Autorize somente esta pasta para os comandos Git.
+              git config --global --add safe.directory /work/upstream
               echo "Source commit: $(git rev-parse HEAD)"
               echo "Build libc: $(getconf GNU_LIBC_VERSION)"
               grep -F "target-cpu=cortex-a53" .cargo/config.toml
               grep -F "armv8-a" build.rs
-              cargo +stable build --release --locked --target aarch64-unknown-linux-gnu
+              # O upstream pode ter Cargo.toml e Cargo.lock momentaneamente dessincronizados.
+              # Permitir que o Cargo atualize o lockfile dentro do checkout descartável.
+              cargo +stable build --release --target aarch64-unknown-linux-gnu
 
               BIN="target/aarch64-unknown-linux-gnu/release/gopher64"
               test -x "$BIN"
