@@ -1,0 +1,184 @@
+name: Build Gopher64 for muOS H700
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-h700:
+    # Runner ARM64 nativo; o build ocorre em Ubuntu 22.04 para linkar com glibc antiga.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout Gopher64 upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: gopher64/gopher64
+          ref: main
+          path: upstream
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Apply Cortex-A53 / ARMv8-A compatibility patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          config = Path('upstream/.cargo/config.toml')
+          build = Path('upstream/build.rs')
+          changes = [
+              (config, 'rustflags = ["-C", "target-cpu=cortex-a76"]',
+               'rustflags = ["-C", "target-cpu=cortex-a53"]'),
+              (build, '"-march=armv8.2-a"', '"-march=armv8-a"'),
+          ]
+          for path, old, new in changes:
+              if not path.exists():
+                  raise SystemExit(f'Arquivo esperado não encontrado: {path}')
+              text = path.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'Esperava 1 ocorrência de {old!r} em {path}; encontrei {count}. O upstream mudou e o patch foi interrompido por segurança.')
+              path.write_text(text.replace(old, new, 1), encoding='utf-8')
+              print(f'Aplicado: {path}: {old} -> {new}')
+          print('Patch ARMv8-A / Cortex-A53 aplicado.')
+          PY
+
+      - name: Prepare muOS application files
+        shell: bash
+        run: |
+          mkdir -p templates/glyph
+          cp upstream/data/icon/gopher64_128x128.png templates/glyph/gopher64.png
+          cat > templates/mux_launch.sh <<'EOF'
+          #!/bin/sh
+          # HELP: Experimental Gopher64 ARM64 build for the Anbernic H700. Vulkan support is not guaranteed.
+          # ICON: gopher64
+          # GRID: Gopher64
+          APP_DIR="/run/muos/storage/application/Gopher64"
+          LOG_DIR="$APP_DIR/logs"
+          LOG_FILE="$LOG_DIR/last-run.log"
+          mkdir -p "$LOG_DIR" 2>/dev/null || exit 1
+          : > "$LOG_FILE" 2>/dev/null || exit 1
+          exec >> "$LOG_FILE" 2>&1
+          printf '\n===== Gopher64 H700 launcher =====\n'
+          date 2>/dev/null || true
+          printf 'APP_DIR=%s\n' "$APP_DIR"
+          printf 'ARCH='; uname -m 2>&1
+          printf 'KERNEL='; uname -r 2>&1
+          printf 'LIBC='; getconf GNU_LIBC_VERSION 2>&1 || true
+          if [ ! -d "$APP_DIR" ]; then echo "ERROR: runtime mount missing: $APP_DIR"; exit 10; fi
+          if [ ! -x "$APP_DIR/gopher64" ]; then echo "ERROR: executable missing"; ls -la "$APP_DIR" 2>&1; exit 11; fi
+          if [ -r /opt/muos/script/var/func.sh ]; then . /opt/muos/script/var/func.sh; else echo "ERROR: muOS func.sh not found"; exit 12; fi
+          if command -v SETUP_APP >/dev/null 2>&1; then SETUP_APP "gopher64" ""; else echo "ERROR: SETUP_APP unavailable"; exit 13; fi
+          if command -v SETUP_STAGE_OVERLAY >/dev/null 2>&1; then SETUP_STAGE_OVERLAY; fi
+          cd "$APP_DIR" || exit 14
+          export SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1
+          printf '\n===== Dynamic library check =====\n'
+          if command -v ldd >/dev/null 2>&1; then ldd "$APP_DIR/gopher64" 2>&1 || true; fi
+          printf '\n===== Starting Gopher64 =====\n'
+          "$APP_DIR/gopher64" "$@"
+          STATUS=$?
+          printf '\n===== Gopher64 exited with status %s =====\n' "$STATUS"
+          exit "$STATUS"
+          EOF
+          chmod 755 templates/mux_launch.sh
+          cat > templates/mux_lang.ini <<'EOF'
+          [full]
+          English=Gopher64 H700
+          Portuguese=Gopher64 H700
+
+          [grid]
+          English=Gopher64
+          Portuguese=Gopher64
+
+          [help]
+          English=Experimental Gopher64 build targeted for Cortex-A53. Vulkan support depends on the muOS GPU driver.
+          Portuguese=Build experimental do Gopher64 para Cortex-A53. O suporte a Vulkan depende do driver grafico do muOS.
+          EOF
+          : > templates/portable.txt
+
+      - name: Build and package in Ubuntu 22.04 (glibc 2.35)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            ubuntu:22.04 bash -euxo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                ca-certificates curl git build-essential make pkg-config cmake ninja-build \
+                zip file binutils python3 \
+                libasound2-dev libpulse-dev libaudio-dev libfribidi-dev libjack-dev libsndio-dev \
+                libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev \
+                libxss-dev libxtst-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev \
+                libgles2-mesa-dev libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev \
+                libthai-dev libusb-1.0-0-dev libpipewire-0.3-dev libwayland-dev libdecor-0-dev \
+                liburing-dev libfontconfig-dev libssl-dev libicu70
+
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              export PATH="/root/.cargo/bin:$PATH"
+              rustup toolchain install stable --profile minimal
+              rustup target add aarch64-unknown-linux-gnu --toolchain stable
+
+              LLVM_VERSION="$(rustc +stable --version --verbose | sed -n "s/^LLVM version: //p")"
+              test -n "$LLVM_VERSION"
+              echo "Using Rust $(rustc +stable --version), LLVM $LLVM_VERSION"
+              curl -fL "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-ARM64.tar.xz" -o /tmp/llvm.tar.xz
+              mkdir -p /opt/llvm
+              tar -xJf /tmp/llvm.tar.xz -C /opt/llvm --strip-components=1
+              export PATH="/opt/llvm/bin:$PATH"
+              export LIBCLANG_PATH="/opt/llvm/lib"
+              export CC=clang CXX=clang++ AR=llvm-ar
+
+              cd /work/upstream
+              echo "Source commit: $(git rev-parse HEAD)"
+              echo "Build libc: $(getconf GNU_LIBC_VERSION)"
+              grep -F "target-cpu=cortex-a53" .cargo/config.toml
+              grep -F "armv8-a" build.rs
+              cargo +stable build --release --locked --target aarch64-unknown-linux-gnu
+
+              BIN="target/aarch64-unknown-linux-gnu/release/gopher64"
+              test -x "$BIN"
+              file "$BIN"
+              readelf -h "$BIN" | grep -E "Class:|Machine:"
+              if readelf --version-info "$BIN" | grep -q "GLIBC_2.39"; then
+                echo "ERROR: binary still references GLIBC_2.39; refusing to package."
+                exit 20
+              fi
+
+              OUT=/work/out
+              APP="$OUT/package/Gopher64"
+              mkdir -p "$APP/glyph"
+              install -m 755 "$BIN" "$APP/gopher64"
+              install -m 755 /work/templates/mux_launch.sh "$APP/mux_launch.sh"
+              install -m 644 /work/templates/mux_lang.ini "$APP/mux_lang.ini"
+              install -m 644 /work/templates/portable.txt "$APP/portable.txt"
+              install -m 644 /work/templates/glyph/gopher64.png "$APP/glyph/gopher64.png"
+              install -m 644 LICENSE "$APP/LICENSE"
+              printf "%s\\n" \
+                "GOPHER64 H700 - EXPERIMENTAL muOS BUILD" \
+                "" \
+                "Built from Gopher64 upstream main with Cortex-A53 / ARMv8-A targets." \
+                "Build environment: Ubuntu 22.04 / glibc 2.35; muOS reported glibc 2.38." \
+                "Source: https://github.com/gopher64/gopher64" \
+                "Source commit: $(git rev-parse HEAD)" \
+                "Install via Applications > Archive Manager." \
+                "Log: MUOS/application/Gopher64/logs/last-run.log" \
+                "Vulkan/Parallel-RDP compatibility with the H700 Mali-G31 is not guaranteed." \
+                > "$APP/LEIA-ME.txt"
+
+              mkdir -p "$OUT"
+              cd "$OUT/package"
+              zip -9 -r "$OUT/Gopher64-H700-muOS-v3.muxapp" Gopher64
+              ls -lh "$OUT/Gopher64-H700-muOS-v3.muxapp"
+            '
+
+      - name: Publish .muxapp artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gopher64-H700-muOS-v3
+          path: out/Gopher64-H700-muOS-v3.muxapp
+          if-no-files-found: error
+          retention-days: 14
